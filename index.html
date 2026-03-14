@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pistol Shooter: Pro Masterpiece</title>
+  <style>
+    body { margin: 0; background: #050505; overflow: hidden; font-family: 'Inter', sans-serif; }
+    main { position: relative; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+    canvas { display: block; max-width: 100%; max-height: 100%; background: radial-gradient(circle, #1a1a1a 0%, #050505 100%); }
+    #ui {
+      position: absolute; top: 40px; left: 40px; color: #00ffcc;
+      z-index: 10; pointer-events: none;
+    }
+    .score { font-size: 54px; font-weight: 900; text-shadow: 0 0 20px rgba(0,255,204,0.3); }
+    .streak { font-size: 18px; opacity: 0.7; letter-spacing: 2px; text-transform: uppercase; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="ui">
+    <div id="scoreDisplay" class="score">0000</div>
+    <div id="streakDisplay" class="streak">COMBO: x1</div>
+  </div>
+  <main>
+    <video autoplay playsinline style="display:none"></video>
+    <canvas id="gameCanvas"></canvas>
+  </main>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const video = document.querySelector('video');
+
+    const config = {
+      w: 1280, h: 720,
+      magnet: 115,
+      flickLimit: 18,
+      colors: ['#FFD700', '#C0C0C0', '#CD7F32', '#00E5FF', '#FF00FF']
+    };
+
+    canvas.width = config.w;
+    canvas.height = config.h;
+
+    const state = {
+      score: 0, streak: 1,
+      coins: [], vfx: [], particles: [],
+      hand: null,
+      canShoot: true,
+      thumbHistory: [],
+      aim: { x: 640, y: 360 },
+      recoil: 0,
+      lastUpdate: performance.now()
+    };
+
+    const createCoin = () => {
+      const side = Math.floor(Math.random() * 4);
+      let x, y;
+      if (side === 0) { x = Math.random() * config.w; y = -100; }
+      else if (side === 1) { x = Math.random() * config.w; y = config.h + 100; }
+      else if (side === 2) { x = -100; y = Math.random() * config.h; }
+      else { x = config.w + 100; y = Math.random() * config.h; }
+
+      const angle = Math.atan2(config.h/2 - y, config.w/2 - x) + (Math.random() - 0.5) * 0.4;
+      const speed = 4 + (state.score / 6000) + Math.random() * 2;
+
+      return {
+        x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+        r: 32, rot: Math.random() * Math.PI, spin: 0.05 + Math.random() * 0.1,
+        color: config.colors[Math.floor(Math.random() * config.colors.length)]
+      };
+    };
+
+    const createShatter = (x, y, color) => {
+      for(let i=0; i<10; i++) {
+        state.particles.push({
+          x, y, vx: (Math.random()-0.5)*15, vy: (Math.random()-0.5)*15,
+          life: 1.0, color
+        });
+      }
+    };
+
+    for(let i=0; i < 4; i++) state.coins.push(createCoin());
+
+    const gameLoop = (now) => {
+      const dt = (now - state.lastUpdate) / 16.67;
+      state.lastUpdate = now;
+
+      ctx.clearRect(0, 0, config.w, config.h);
+
+      ctx.save();
+      if (state.recoil > 0) {
+        ctx.translate(0, -state.recoil);
+        state.recoil *= 0.85;
+      }
+
+      // Coins
+      for(let i = state.coins.length - 1; i >= 0; i--) {
+        const c = state.coins[i];
+        c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.spin * dt;
+        const sw = Math.cos(c.rot) * c.r;
+
+        ctx.save();
+        ctx.translate(c.x, c.y);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, Math.abs(sw), c.r, 0, 0, Math.PI * 2);
+        ctx.fillStyle = c.color;
+        ctx.shadowBlur = 15; ctx.shadowColor = c.color;
+        ctx.fill();
+        ctx.restore();
+
+        if (Math.hypot(c.x - config.w/2, c.y - config.h/2) < 40) state.coins[i] = createCoin();
+      }
+
+      // Particles
+      for(let i = state.particles.length - 1; i >= 0; i--) {
+        const p = state.particles[i];
+        p.x += p.vx * dt; p.y += p.vy * dt; p.life -= 0.03 * dt;
+        if(p.life <= 0) state.particles.splice(i, 1);
+        else {
+          ctx.fillStyle = p.color;
+          ctx.globalAlpha = p.life;
+          ctx.fillRect(p.x, p.y, 6, 6);
+        }
+      }
+      ctx.globalAlpha = 1.0;
+
+      if (state.hand) {
+        const lm = state.hand;
+        const indexX = (1 - lm[8].x) * config.w;
+        const indexY = lm[8].y * config.h;
+        const thumbY = lm[4].y * config.h;
+
+        state.aim.x += (indexX - state.aim.x) * 0.45;
+        state.aim.y += (indexY - state.aim.y) * 0.45;
+
+        let fx = state.aim.x, fy = state.aim.y, target = -1;
+        state.coins.forEach((c, i) => {
+          if (Math.hypot(c.x - fx, c.y - fy) < config.magnet) {
+            fx = c.x; fy = c.y; target = i;
+          }
+        });
+
+        // Pistol pose check
+        if (lm[8].y < lm[6].y && lm[12].y > lm[10].y && lm[16].y > lm[14].y) {
+          ctx.strokeStyle = '#00ffcc';
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(state.aim.x, state.aim.y); ctx.lineTo(fx, fy); ctx.stroke();
+          ctx.strokeRect(fx - 25, fy - 25, 50, 50);
+
+          state.thumbHistory.push(thumbY);
+          if (state.thumbHistory.length > 3) state.thumbHistory.shift();
+          if (state.thumbHistory.length === 3) {
+            const vel = state.thumbHistory[0] - state.thumbHistory[2];
+            if (vel > config.flickLimit && state.canShoot) {
+              state.canShoot = false;
+              state.recoil = 25;
+              if (target !== -1) {
+                const c = state.coins[target];
+                state.score += 100 * state.streak; state.streak++;
+                createShatter(c.x, c.y, c.color);
+                state.vfx.push({ t: `+${100*(state.streak-1)}`, x: c.x, y: c.y, l: 25, c: c.color });
+                state.coins[target] = createCoin();
+              } else {
+                state.streak = 1;
+                state.vfx.push({ t: 'MISS', x: fx, y: fy, l: 20, c: '#ff3366' });
+              }
+              document.getElementById('scoreDisplay').innerText = state.score.toString().padStart(4, '0');
+              document.getElementById('streakDisplay').innerText = `COMBO: x${state.streak}`;
+              setTimeout(() => state.canShoot = true, 250);
+            }
+          }
+        }
+      }
+
+      for(let i = state.vfx.length - 1; i >= 0; i--) {
+        const v = state.vfx[i];
+        v.y -= 2 * dt; v.l -= dt;
+        if (v.l <= 0) state.vfx.splice(i, 1);
+        else {
+          ctx.font = '900 36px Inter'; ctx.fillStyle = v.c; ctx.textAlign = 'center';
+          ctx.fillText(v.t, v.x, v.y);
+        }
+      }
+      ctx.restore();
+      requestAnimationFrame(gameLoop);
+    };
+
+    const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8, minTrackingConfidence: 0.8 });
+    hands.onResults(r => { state.hand = r.multiHandLandmarks?.[0] || null; });
+
+    new Camera(video, { onFrame: async () => await hands.send({ image: video }), width: 1280, height: 720 }).start();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>
