@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pistol Shooter</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #050505; overflow: hidden; font-family: 'Courier New', monospace; }
+    main { position: relative; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+    canvas { display: block; max-width: 100%; max-height: 100%; }
+
+    #ui {
+      position: absolute;
+      top: 32px; left: 40px;
+      color: #00ffcc;
+      z-index: 10;
+      pointer-events: none;
+      user-select: none;
+    }
+    .score {
+      font-size: 56px;
+      font-weight: 900;
+      letter-spacing: 6px;
+      text-shadow: 0 0 20px #00ffcc88;
+    }
+    .combo {
+      font-size: 15px;
+      letter-spacing: 3px;
+      opacity: 0.65;
+      margin-top: 4px;
+    }
+
+    #hint {
+      position: absolute;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffffff44;
+      font-size: 13px;
+      letter-spacing: 2px;
+      pointer-events: none;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="ui">
+    <div id="scoreDisplay" class="score">0000</div>
+    <div id="streakDisplay" class="combo">COMBO ×1</div>
+  </div>
+  <main>
+    <video autoplay playsinline style="display:none"></video>
+    <canvas id="gameCanvas"></canvas>
+  </main>
+  <div id="hint">☝ RAISE INDEX FINGER · FLICK THUMB UP TO SHOOT</div>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx    = canvas.getContext('2d');
+    const video  = document.querySelector('video');
+
+    // ─── Config ────────────────────────────────────────────────────────────────
+    const W = 1280, H = 720;
+    canvas.width  = W;
+    canvas.height = H;
+
+    const CFG = {
+      maxCoins:   5,
+      magnet:     130,          // snap-to-target radius (px)
+      flickLimit: 16,           // thumb flick threshold
+      baseSpeed:  2.0,          // reduced from 4 → feels natural
+      speedScale: 8000,         // score divisor for difficulty ramp
+      colors: ['#FFD700', '#C0C0C0', '#CD7F32', '#00E5FF', '#FF44AA'],
+    };
+
+    // ─── State ─────────────────────────────────────────────────────────────────
+    const S = {
+      score: 0,
+      streak: 1,
+      coins: [],
+      particles: [],
+      vfx: [],
+      hand: null,
+      canShoot: true,
+      thumbHistory: [],
+      aim: { x: W / 2, y: H / 2 },
+      recoil: 0,
+      lastUpdate: performance.now(),
+    };
+
+    // ─── Coin Factory ──────────────────────────────────────────────────────────
+    function createCoin() {
+      const side = (Math.random() * 4) | 0;
+      const buf  = 160;
+      let x, y;
+
+      if      (side === 0) { x = Math.random() * W; y = -buf; }
+      else if (side === 1) { x = Math.random() * W; y = H + buf; }
+      else if (side === 2) { x = -buf; y = Math.random() * H; }
+      else                 { x = W + buf; y = Math.random() * H; }
+
+      // Aim for a random point near centre
+      const tx    = W / 2 + (Math.random() - 0.5) * 400;
+      const ty    = H / 2 + (Math.random() - 0.5) * 300;
+      const angle = Math.atan2(ty - y, tx - x);
+      // BUG FIX: capped speed — base + gentle difficulty ramp, no random spike
+      const speed = CFG.baseSpeed + (S.score / CFG.speedScale) + Math.random() * 1.2;
+
+      return {
+        x, y,
+        vx:    Math.cos(angle) * speed,
+        vy:    Math.sin(angle) * speed,
+        r:     30,
+        rot:   Math.random() * Math.PI,
+        spin:  0.04 + Math.random() * 0.08,
+        color: CFG.colors[(Math.random() * CFG.colors.length) | 0],
+      };
+    }
+
+    // Initial coins
+    for (let i = 0; i < CFG.maxCoins; i++) S.coins.push(createCoin());
+
+    // ─── Draw Helpers ──────────────────────────────────────────────────────────
+    function drawCoin(c) {
+      const sw = Math.cos(c.rot) * c.r;
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.shadowBlur  = 22;
+      ctx.shadowColor = c.color;
+      ctx.fillStyle   = c.color;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, Math.max(1, Math.abs(sw)), c.r, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Shine stripe
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle   = '#fff';
+      ctx.beginPath();
+      ctx.ellipse(-sw * 0.25, -c.r * 0.3, Math.max(1, Math.abs(sw) * 0.3), c.r * 0.18, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawCrosshair(x, y, color) {
+      const s = 28;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 1.5;
+      ctx.globalAlpha = 0.9;
+      // Four corner brackets
+      for (let dx = -1; dx <= 1; dx += 2) {
+        for (let dy = -1; dy <= 1; dy += 2) {
+          ctx.beginPath();
+          ctx.moveTo(x + dx * s,       y + dy * (s - 10));
+          ctx.lineTo(x + dx * s,       y + dy * s);
+          ctx.lineTo(x + dx * (s - 10), y + dy * s);
+          ctx.stroke();
+        }
+      }
+      // Centre dot
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // ─── Main Loop ─────────────────────────────────────────────────────────────
+    function gameLoop(now) {
+      // BUG FIX: clamp dt so tab-switch / first-frame spikes don't teleport coins
+      const dt = Math.min((now - S.lastUpdate) / 16.667, 3);
+      S.lastUpdate = now;
+
+      // Clear
+      ctx.fillStyle = '#050505';
+      ctx.fillRect(0, 0, W, H);
+
+      // Recoil shake
+      ctx.save();
+      if (S.recoil > 0.5) {
+        ctx.translate(0, -S.recoil);
+        S.recoil *= 0.82;
+      } else {
+        S.recoil = 0;
+      }
+
+      // ── Coins ──────────────────────────────────────────────────────────────
+      const margin = 220;
+      for (let i = S.coins.length - 1; i >= 0; i--) {
+        const c = S.coins[i];
+        c.x  += c.vx  * dt;
+        c.y  += c.vy  * dt;
+        c.rot += c.spin * dt;
+
+        drawCoin(c);
+
+        if (c.x < -margin || c.x > W + margin || c.y < -margin || c.y > H + margin) {
+          S.coins[i] = createCoin();
+        }
+      }
+      // Safety refill (shouldn't be needed but just in case)
+      while (S.coins.length < CFG.maxCoins) S.coins.push(createCoin());
+
+      // ── Particles ──────────────────────────────────────────────────────────
+      // BUG FIX: was using forEach+splice which skips elements on removal.
+      // Now using filter — clean, correct, no index corruption.
+      S.particles = S.particles.filter(p => {
+        p.x    += p.vx * dt;
+        p.y    += p.vy * dt;
+        p.vy   += 0.3 * dt;   // gentle gravity
+        p.life -= 0.028 * dt;
+        if (p.life <= 0) return false;
+
+        ctx.save();
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle   = p.color;
+        ctx.shadowBlur  = 8;
+        ctx.shadowColor = p.color;
+        const sz = 5 + (1 - p.life) * 3;
+        ctx.fillRect(p.x - sz / 2, p.y - sz / 2, sz, sz);
+        ctx.restore();
+        return true;
+      });
+
+      // ── Hand / Shooting ────────────────────────────────────────────────────
+      if (S.hand) {
+        const lm = S.hand;
+
+        // Mirror x (front camera), map to canvas
+        const ax = (1 - lm[8].x) * W;
+        const ay =      lm[8].y  * H;
+        const ty =      lm[4].y  * H;
+
+        // Smooth aim tracking — 0.35 feels responsive without jitter
+        S.aim.x += (ax - S.aim.x) * 0.35;
+        S.aim.y += (ay - S.aim.y) * 0.35;
+
+        // Magnet snap: find nearest coin within radius
+        let snapX = S.aim.x, snapY = S.aim.y, targetIdx = -1;
+        let best  = CFG.magnet;
+        S.coins.forEach((c, i) => {
+          const d = Math.hypot(c.x - S.aim.x, c.y - S.aim.y);
+          if (d < best) { best = d; snapX = c.x; snapY = c.y; targetIdx = i; }
+        });
+
+        // Gesture: index finger extended, middle + ring + pinky curled
+        const indexUp  = lm[8].y  < lm[6].y;
+        const middleDown = lm[12].y > lm[10].y;
+        const ringDown   = lm[16].y > lm[14].y;
+        const pinkyDown  = lm[20].y > lm[18].y;
+
+        if (indexUp && middleDown && ringDown && pinkyDown) {
+          // Laser beam
+          ctx.save();
+          ctx.strokeStyle = targetIdx !== -1 ? '#00ffcc' : '#ff4466';
+          ctx.lineWidth   = 1.5;
+          ctx.setLineDash([6, 8]);
+          ctx.globalAlpha = 0.6;
+          ctx.beginPath();
+          ctx.moveTo(S.aim.x, S.aim.y);
+          ctx.lineTo(snapX, snapY);
+          ctx.stroke();
+          ctx.restore();
+
+          drawCrosshair(snapX, snapY, targetIdx !== -1 ? '#00ffcc' : '#ff4466');
+
+          // Thumb flick detection
+          S.thumbHistory.push(ty);
+          if (S.thumbHistory.length > 3) S.thumbHistory.shift();
+
+          if (S.thumbHistory.length === 3 && S.canShoot) {
+            // Positive vel = thumb moved UP (y decreased)
+            const vel = S.thumbHistory[0] - S.thumbHistory[2];
+            if (vel > CFG.flickLimit) {
+              S.canShoot = false;
+              S.recoil   = 22;
+
+              if (targetIdx !== -1) {
+                const c = S.coins[targetIdx];
+                const pts = 100 * S.streak;
+                S.score  += pts;
+                S.streak += 1;
+
+                // Burst particles
+                for (let k = 0; k < 12; k++) {
+                  S.particles.push({
+                    x: c.x, y: c.y,
+                    vx: (Math.random() - 0.5) * 18,
+                    vy: (Math.random() - 0.5) * 18 - 3,
+                    life: 1.0,
+                    color: c.color,
+                  });
+                }
+                S.vfx.push({ t: `+${pts}`, x: c.x, y: c.y - 20, l: 28, c: c.color });
+                S.coins[targetIdx] = createCoin();
+              } else {
+                S.streak = 1;
+                S.vfx.push({ t: 'MISS', x: snapX, y: snapY, l: 22, c: '#ff3366' });
+              }
+
+              document.getElementById('scoreDisplay').innerText =
+                S.score.toString().padStart(4, '0');
+              document.getElementById('streakDisplay').innerText =
+                `COMBO ×${S.streak}`;
+
+              setTimeout(() => { S.canShoot = true; }, 260);
+            }
+          }
+        } else {
+          // Not aiming — clear thumb history
+          S.thumbHistory.length = 0;
+        }
+      }
+
+      // ── VFX Floating Text ──────────────────────────────────────────────────
+      // BUG FIX: same forEach+splice issue — replaced with filter
+      S.vfx = S.vfx.filter(v => {
+        v.y -= 2.2 * dt;
+        v.l -= dt;
+        if (v.l <= 0) return false;
+
+        const alpha = Math.min(1, v.l / 10);
+        ctx.save();
+        ctx.globalAlpha  = alpha;
+        ctx.font         = '900 34px "Courier New", monospace';
+        ctx.fillStyle    = v.c;
+        ctx.shadowBlur   = 14;
+        ctx.shadowColor  = v.c;
+        ctx.textAlign    = 'center';
+        ctx.fillText(v.t, v.x, v.y);
+        ctx.restore();
+        return true;
+      });
+
+      ctx.restore(); // end recoil transform
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ─── MediaPipe Setup ───────────────────────────────────────────────────────
+    const hands = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
+    });
+
+    hands.setOptions({
+      maxNumHands:            1,
+      modelComplexity:        1,
+      minDetectionConfidence: 0.75,
+      minTrackingConfidence:  0.75,
+    });
+
+    hands.onResults(r => {
+      S.hand = r.multiHandLandmarks?.[0] ?? null;
+    });
+
+    new Camera(video, {
+      onFrame: async () => await hands.send({ image: video }),
+      width:  1280,
+      height: 720,
+    }).start();
+
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>
